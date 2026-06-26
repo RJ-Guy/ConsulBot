@@ -1,6 +1,6 @@
-# Frontend Implementation Plan: Sales Call Prep-Sheet Generator
+# Frontend Implementation Plan: Sales Call Prep-Sheet UI (With History Sidebar)
 
-This document provides a highly detailed, component-by-component frontend structure, custom CSS styling guides, and implementation instructions for the **ConsulBot Sales Call Prep-Sheet UI**. 
+This document provides a highly detailed, component-by-component frontend structure, custom CSS styling guides, and implementation instructions for the **ConsulBot Sales Call Prep-Sheet UI**, now featuring a database-driven "Recent Briefings" history sidebar.
 
 A frontend development agent should be able to read this file and build the user interface (`frontend/app/app.py`) and verify correctness using the isolation testing guide.
 
@@ -8,15 +8,17 @@ A frontend development agent should be able to read this file and build the user
 
 ## 1. Directory Structure
 
-The frontend code will reside in `frontend/app/app.py` and communicate directly with `backend/orchestrator.py`.
+The frontend code will reside in `frontend/app/app.py` and communicate directly with `backend/orchestrator.py` and the database helper methods in `backend/database.py`.
 
 ```text
 ConsulBot/
 ├── Plan/
 │   ├── backend_plan.md
-│   └── frontend_plan.md              # This plan
+│   ├── frontend_plan.md              # This plan
+│   └── dataBase.md
 ├── backend/
 │   ├── orchestrator.py               # Chained backend pipeline
+│   ├── database.py                   # Supabase client helpers
 │   ├── schemas.py                    # Data validation models
 │   └── ...
 ├── frontend/
@@ -26,8 +28,6 @@ ConsulBot/
 │   └── test_frontend.py              # UI Isolation test script
 ```
 
-
-
 ---
 
 ## 2. Design Aesthetics & Styling Guidelines
@@ -36,11 +36,12 @@ To ensure a premium, modern, and high-impact visual identity:
 * **Color Palette**: Use dark background tones, glassmorphism card styles, and neon/pastel accents:
   - Background: Dark slate/grey (`#0E1117`)
   - Accent Primary: Electric Cyan/Blue (`#00F2FE` or `#1E90FF`)
-  - Accent Success (Live data): Emerald Green (`#10B981`)
-  - Accent Warning (Cached data): Amber Orange (`#F59E0B`)
-* **Typography**: Ingest Google Fonts (e.g., *Inter* or *Outfit*) to replace default system fonts.
+  - Accent Success (Database hit): Emerald Green (`#10B981`)
+  - Accent Info (Live API generation): Sky Blue (`#3B82F6`)
+  - Accent Warning (Cached/Mock file fallback): Amber Orange (`#F59E0B`)
+* **Typography**: Ingest Google Fonts (e.g., *Outfit*) to replace default system fonts.
 * **Layout Structure**: 
-  - Left Sidebar or top-row grid for inputs.
+  - Left Sidebar containing both the input form and a "Recent Briefings" history section.
   - Main panel displaying the generated prep-sheet with clean dividers, card containers, and highlighted badges.
   - Interactivity: Custom CSS hover states, copy buttons, and download indicators.
 
@@ -48,13 +49,14 @@ To ensure a premium, modern, and high-impact visual identity:
 
 ## 3. Streamlit Entry Point (`frontend/app/app.py`)
 
-This file handles user input, binds to the async orchestrator pipeline, manages state persistence (to prevent re-runs from wiping results), and renders custom HTML/CSS cards.
+This file handles user inputs, loads historical dossiers from Supabase, interacts with the orchestrator, handles page state, and displays the UI.
 
 ```python
 import streamlit as st
 import asyncio
 import datetime
 from backend.orchestrator import generate_prep_sheet
+from backend.database import fetch_recent_briefings
 from backend.schemas import FullPrepSheetSchema
 
 # -------------------------------------------------------------
@@ -105,10 +107,20 @@ CUSTOM_CSS = """
     }
     
     /* Metadata Badges */
-    .badge-live {
+    .badge-database {
         background-color: rgba(16, 185, 129, 0.15);
         color: #10B981;
         border: 1px solid rgba(16, 185, 129, 0.3);
+        padding: 4px 12px;
+        border-radius: 20px;
+        font-size: 0.8rem;
+        font-weight: 600;
+    }
+    
+    .badge-live {
+        background-color: rgba(59, 130, 246, 0.15);
+        color: #3B82F6;
+        border: 1px solid rgba(59, 130, 246, 0.3);
         padding: 4px 12px;
         border-radius: 20px;
         font-size: 0.8rem;
@@ -182,38 +194,62 @@ def get_markdown_download_content(data: FullPrepSheetSchema) -> str:
 """
 
 # -------------------------------------------------------------
-# 3. Sidebar Input Interface
+# 3. Sidebar Input Form & History Panel
 # -------------------------------------------------------------
 st.sidebar.title("💼 Call Prep Input")
-st.sidebar.markdown("Generate custom pre-call intelligence sheets in seconds.")
 
-company_domain = st.sidebar.text_input(
-    "Company Domain / URL", 
-    value="stripe.com", 
-    placeholder="e.g. stripe.com",
-    help="Target business domain name."
-)
-job_title = st.sidebar.text_input(
-    "Prospect Job Title", 
-    value="VP of Customer Support", 
-    placeholder="e.g. VP of Sales, Engineering Director"
-)
-seller_product = st.sidebar.text_area(
-    "Your Product / Solution", 
-    value="An AI agent platform that resolves customer support tickets during weekends.",
-    placeholder="Describe what you are selling..."
-)
+# A. Input Form Section
+with st.sidebar.expander("New Briefing Inputs", expanded=True):
+    company_domain = st.text_input(
+        "Company Domain / URL", 
+        value="stripe.com", 
+        placeholder="e.g. stripe.com"
+    )
+    job_title = st.text_input(
+        "Prospect Job Title", 
+        value="VP of Customer Support", 
+        placeholder="e.g. VP of Sales"
+    )
+    seller_product = st.text_area(
+        "Your Product / Solution", 
+        value="An AI agent platform that resolves customer support tickets during weekends."
+    )
+    
+    generate_btn = st.button("Generate Prep Sheet", type="primary", use_container_width=True)
+
+# B. History Sidebar Section
+st.sidebar.markdown("---")
+st.sidebar.subheader("🗄️ Recent Briefings (DB)")
+
+try:
+    # Fetch recent generation records from PostgreSQL/Supabase
+    history_records = asyncio.run(fetch_recent_briefings(limit=8))
+except Exception:
+    history_records = []
+
+if history_records:
+    for idx, record in enumerate(history_records):
+        company_name = record["company_profiles"]["company_name"]
+        role = record["target_role"]
+        # Creating buttons for each historical record
+        button_label = f"🏢 {company_name} | 👤 {role}"
+        if st.sidebar.button(button_label, key=f"hist_{idx}", use_container_width=True):
+            # Load stored JSON data from Database into Streamlit Session State
+            st.session_state["prep_sheet_result"] = FullPrepSheetSchema.model_validate(record["ai_generated_payload"])
+            st.rerun()
+else:
+    st.sidebar.info("No briefings generated yet.")
 
 # -------------------------------------------------------------
-# 4. Action Trigger & Execution
+# 4. Action Trigger & Pipeline Execution
 # -------------------------------------------------------------
-if st.sidebar.button("Generate Prep Sheet", type="primary", use_container_width=True):
+if generate_btn:
     if not company_domain or not job_title or not seller_product:
         st.sidebar.error("All input fields are required!")
     else:
-        with st.spinner("Analyzing domain and triggering sales agents..."):
+        with st.spinner("Analyzing inputs and querying agents..."):
             try:
-                # Resolve the async orchestrator pipeline inside Streamlit's sync runtime
+                # Trigger the orchestrator pipeline (checks database before calling models)
                 result: FullPrepSheetSchema = asyncio.run(
                     generate_prep_sheet(
                         company_domain=company_domain,
@@ -221,7 +257,6 @@ if st.sidebar.button("Generate Prep Sheet", type="primary", use_container_width=
                         seller_product=seller_product
                     )
                 )
-                # Store the result in Streamlit Session State to prevent loss on re-runs
                 st.session_state["prep_sheet_result"] = result
                 st.success("Analysis complete!")
             except Exception as e:
@@ -240,10 +275,20 @@ if "prep_sheet_result" in st.session_state:
         st.caption(f"Prepared for Prospect Role: **{data.job_title}** | Pitched Solution: *{data.seller_product}*")
     
     with col_meta:
-        badge_style = "badge-live" if data.meta.data_source == "live" else "badge-cached"
+        # Determine badge type depending on whether data source was "database", "live", or "cached"
+        if data.meta.data_source == "database":
+            badge_class = "badge-database"
+            badge_label = "DATABASE HIT (0.1s)"
+        elif data.meta.data_source == "live":
+            badge_class = "badge-live"
+            badge_label = "LIVE API GENERATION"
+        else:
+            badge_class = "badge-cached"
+            badge_label = "MOCK FALLBACK"
+            
         st.markdown(
-            f"<div style='text-align: right; margin-top: 15px;'>"
-            f"<span class='{badge_style}'>{data.meta.data_source.upper()} DATA</span>"
+            f"<div style='text-align: right; margin-top: 15px;'> "
+            f"<span class='{badge_class}'>{badge_label}</span>"
             f"<div style='font-size: 0.75rem; color: grey; margin-top: 5px;'>{data.meta.timestamp[:19]} UTC</div>"
             f"</div>", 
             unsafe_allow_html=True
@@ -251,7 +296,7 @@ if "prep_sheet_result" in st.session_state:
     
     st.markdown("---")
     
-    # Grid Layout for Content
+    # Content Columns
     left_column, right_column = st.columns([1, 1])
     
     with left_column:
@@ -287,7 +332,7 @@ if "prep_sheet_result" in st.session_state:
         )
 
     with right_column:
-        # D. Inferred Pain Points (Rendered as expanders for visual depth)
+        # D. Inferred Pain Points
         st.markdown("<div class='section-title'>🎯 Strategic Pain Points</div>", unsafe_allow_html=True)
         for idx, p in enumerate(data.pain_points.strategic_pain_points):
             with st.expander(f"Challenge {idx+1}: {p.challenge}", expanded=True):
@@ -307,38 +352,23 @@ if "prep_sheet_result" in st.session_state:
             unsafe_allow_html=True
         )
 else:
-    st.info("👈 Enter company credentials and click **'Generate Prep Sheet'** in the sidebar to begin.")
+    st.info("👈 Enter company credentials and click **'Generate Prep Sheet'** or select a **Recent Briefing** to begin.")
 ```
 
 ---
 
-## 4. Step-by-Step Frontend Agent Directives
+## 4. UI Isolation & Rendering Test Script
 
-The frontend agent should follow this sequence to implement and test the UI.
-
-1. **Verify Environment**: Make sure `streamlit` is active in the virtual environment.
-2. **Implement app.py**: Initialize `frontend/app/app.py` with the Streamlit skeletons and custom CSS classes.
-3. **Verify State Control**: Click inputs, collapse cards, and ensure that interacting with components (e.g. expanding cards) does not re-trigger backend agent calls.
-4. **Link Backend**: Bind the button click to `asyncio.run(generate_prep_sheet(...))`.
-
----
-
-## 5. UI Isolation & Rendering Test Script
-
-The backend agent requires API keys, but the frontend layout can be tested entirely **offline** using mock data objects. 
-
-Instruct the frontend agent to create `tests/test_frontend.py` to launch the UI with mock responses:
+The database and LLM calls can be mocked in UI testing by creating `tests/test_frontend.py` to bypass model execution:
 
 ```python
 """
 UI Isolation Test: Run via `streamlit run tests/test_frontend.py`
-This allows testing all CSS styles, badges, columns, and downloads without calling LLMs.
 """
 import sys
 import os
 import streamlit as st
 
-# Inject workspace root into system path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from backend.schemas import (
@@ -351,7 +381,7 @@ from backend.schemas import (
     MetaSchema
 )
 
-# Mock schema response objects matching validations
+# Mock schema response objects
 mock_sheet = FullPrepSheetSchema(
     company_name="stripe.com",
     job_title="VP of Customer Support",
@@ -381,20 +411,13 @@ mock_sheet = FullPrepSheetSchema(
         tailored_pitch="ConsulBot fits into Stripe's infrastructure by automatically managing client ticket loads over the weekend. It ensures SLAs stay below 15 minutes, allowing engineering teams to focus strictly on API core updates."
     ),
     meta=MetaSchema(
-        data_source="cached",
-        timestamp="2026-06-23T21:55:00Z"
+        data_source="database", # Simulate database hit
+        timestamp="2026-06-25T21:55:00Z"
     )
 )
 
-# Save mock to session state to bypass backend processing
 st.session_state["prep_sheet_result"] = mock_sheet
 
 # Import and execute the UI script
 import frontend.app.app as app
 ```
-
-Run this command to check the visual rendering:
-```bash
-uv run streamlit run tests/test_frontend.py
-```
-This launches a local development server showcasing the premium glassmorphic UI, metadata badges, downloadable markdown files, and structured columns.

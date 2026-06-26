@@ -4,53 +4,57 @@ from pydantic import BaseModel, Field
 class CompanyBriefSchema(BaseModel):
     """
     TODO: Define company brief fields:
-    - short_summary (str): Concise 2-sentence summary.
-    - recent_milestones (List[str]): 0 to 2 milestones.
+    - short_summary (str): Concise 2-sentence summary of what the company does.
+    - recent_milestones (List[str]): List of 0 to 2 recent company milestones.
     """
     pass
 
 class PainPointItem(BaseModel):
     """
-    TODO: Define challenge and why_it_matters fields.
+    TODO: Define specific prospect challenges and relevance details:
+    - challenge (str): The strategic/operational issue.
+    - why_it_matters (str): Impact on metrics/operations.
     """
     pass
 
 class PainPointSchema(BaseModel):
     """
     TODO: Define strategic_pain_points (List[PainPointItem]).
-    - Must validate that the list has exactly 3 items.
+    - Validate that the list contains exactly 3 pain points.
     """
     pass
 
 class IcebreakerSchema(BaseModel):
     """
     TODO: Define icebreaker_questions (List[str]).
-    - Must validate 2 to 3 items ending with '?'.
+    - Validate that the list contains 2 to 3 questions.
+    - Validate that each question ends with a question mark '?'.
     """
     pass
 
 class HookPitchSchema(BaseModel):
     """
-    TODO: Define hook and pitch fields:
-    - golden_hook (str): Max 30 words B2B opener.
-    - tailored_pitch (str): 3-4 sentence value prop.
+    TODO: Define cold hook and product pitch value propositions:
+    - golden_hook (str): 30 words or less conversational B2B opener.
+    - tailored_pitch (str): 3-to-4 sentence customized pitch.
+    - Validate golden_hook word limit.
     """
     pass
 
 class MetaSchema(BaseModel):
     """
-    TODO: Define metadata tracking fields:
-    - data_source (Literal['live', 'cached']).
-    - timestamp (str): ISO formatted time.
+    TODO: Define cache validation tracking details:
+    - data_source (Literal['live', 'cached', 'database']): Origin source of data.
+    - timestamp (str): UTC ISO 8601 generation timestamp.
     """
     pass
 
 class FullPrepSheetSchema(BaseModel):
     """
-    TODO: Combine all component schemas:
-    - company_name (str)
-    - job_title (str)
-    - seller_product (str)
+    TODO: Aggregate all constituent schemas:
+    - company_name (str): Domain query name.
+    - job_title (str): Target prospect job title.
+    - seller_product (str): Seller solution product details.
     - company_brief (CompanyBriefSchema)
     - pain_points (PainPointSchema)
     - icebreakers (IcebreakerSchema)

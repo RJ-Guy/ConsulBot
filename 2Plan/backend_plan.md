@@ -1,8 +1,8 @@
-# Backend Implementation Plan: Sales Call Prep-Sheet Generator
+# Backend Implementation Plan: Sales Call Prep-Sheet Generator (With Database Caching)
 
-This document provides a highly detailed, component-by-component backend structure, interface specification, and step-by-step implementation guide for the **ConsulBot Sales Call Prep-Sheet Generator** backend. 
+This document provides a highly detailed, component-by-component backend structure, interface specification, and step-by-step implementation guide for the **ConsulBot Sales Call Prep-Sheet Generator** backend, now integrated with a PostgreSQL/Supabase database caching layer. 
 
-A backend development agent should be able to read this file and build the entire core pipeline (`backend/schemas.py`, `backend/scraper.py`, `backend/agents.py`, `backend/orchestrator.py`) and verify correctness using the included test scripts.
+A backend development agent should be able to read this file and build the entire core pipeline (`backend/database.py`, `backend/schemas.py`, `backend/scraper.py`, `backend/agents.py`, `backend/orchestrator.py`) and verify correctness using the included test scripts.
 
 ---
 
@@ -13,22 +13,26 @@ The backend and frontend code will reside in separate `backend/` and `frontend/a
 ```text
 ConsulBot/
 ├── Plan/
-│   └── backend_plan.md               # This plan
+│   ├── backend_plan.md               # This plan
+│   ├── frontend_plan.md
+│   └── dataBase.md                   # Database blueprints
 ├── mock_data/                        # Pre-scraped company fallbacks
 │   ├── stripe.txt                    # Stripe homepage markdown context
 │   ├── vercel.txt                    # Vercel homepage markdown context
 │   └── mock_company.txt              # Standard generic company fallback
 ├── backend/
 │   ├── __init__.py
+│   ├── database.py                   # Supabase database operations
 │   ├── schemas.py                    # Pydantic validation schemas
 │   ├── scraper.py                    # Jina Reader client & caching logic
 │   ├── agents.py                     # Agent system prompts & LLM client
 │   └── orchestrator.py               # Chained pipeline execution logic
 ├── frontend/
 │   └── app/
-│       └── app.py                    # Streamlit UI Entry Point
+│       └── app.py                    # Streamlit UI Entry Point (with DB History)
 ├── tests/                            # Validation and testing scripts
 │   ├── test_schemas.py
+│   ├── test_database.py              # Database integration checks
 │   ├── test_scraper.py
 │   ├── test_agents.py
 │   └── test_orchestrator.py
@@ -36,7 +40,6 @@ ConsulBot/
 ├── .env.example                      # Configuration template
 ├── .gitignore                        # Git exclusion configuration
 └── requirements.txt                  # Dependencies list
-
 ```
 
 ---
@@ -44,13 +47,14 @@ ConsulBot/
 ## 2. Dependencies & Configuration
 
 ### `requirements.txt`
-The project requires asynchronous runtime support, schema validation, HTTP communication, frontend bindings (later), and config management.
+The project requires asynchronous runtime support, schema validation, HTTP communication, database bindings, and config management.
 ```text
 streamlit>=1.30.0
 pydantic>=2.5.0
 httpx>=0.25.0
 python-dotenv>=1.0.0
 openai>=1.3.0
+supabase>=2.3.0
 ```
 
 ### `.env.example`
@@ -60,19 +64,22 @@ Provide these configuration items:
 OPENROUTER_API_KEY=your_openrouter_api_key_here
 JINA_API_KEY=your_jina_api_key_here
 
+# Supabase Configurations
+SUPABASE_URL=your_supabase_project_url_here
+SUPABASE_KEY=your_supabase_service_role_key_here
+
 # LLM Model Configurations (OpenRouter Free Models)
 MODEL_COMPANY_BRIEF=google/gemini-2.5-flash:free
 MODEL_PAIN_POINTS=meta-llama/llama-3-8b-instruct:free
 MODEL_ICEBREAKERS=google/gemini-2.5-flash:free
 MODEL_HOOK_PITCH=meta-llama/llama-3-8b-instruct:free
-
 ```
 
 ---
 
 ## 3. Pydantic Schemas (`backend/schemas.py`)
 
-Every agent step is constrained by a JSON contract enforced via Pydantic. Ensure strict types, explicit custom validators, and clean error descriptions are defined.
+Every agent step is constrained by a JSON contract enforced via Pydantic. Make sure to allow `"database"` as a valid data source in metadata.
 
 ```python
 import datetime
@@ -156,7 +163,7 @@ class HookPitchSchema(BaseModel):
 # -------------------------------------------------------------
 
 class MetaSchema(BaseModel):
-    data_source: Literal["live", "cached"] = Field(..., description="Source of the scraped data.")
+    data_source: Literal["live", "cached", "database"] = Field(..., description="Source of the scraped data / cache status.")
     timestamp: str = Field(
         default_factory=lambda: datetime.datetime.now(datetime.timezone.utc).isoformat(),
         description="ISO 8601 generation timestamp."
@@ -179,18 +186,138 @@ class FullPrepSheetSchema(BaseModel):
 
 ---
 
-## 4. Data Scraping & Mock Fallback Layer (`backend/scraper.py`)
+## 4. Database Helper Layer (`backend/database.py`)
 
-The scraper uses **Jina Reader API** (`https://r.jina.ai/`) to extract company homepage context. It must cleanly handle rate limits and fall back to local mock text files when offline or when specific domains are queried.
+This module manages connectivity and queries to Supabase.
+
+```python
+import os
+from typing import Dict, Any, Optional, List
+from supabase import create_client, Client
+
+# Global supabase client initialization
+_supabase_client: Optional[Client] = None
+
+def get_supabase_client() -> Optional[Client]:
+    global _supabase_client
+    if _supabase_client is not None:
+        return _supabase_client
+        
+    url = os.getenv("SUPABASE_URL")
+    key = os.getenv("SUPABASE_KEY")
+    if not url or not key:
+        return None
+        
+    _supabase_client = create_client(url, key)
+    return _supabase_client
+
+async def fetch_cached_company(company_name: str) -> Optional[Dict[str, Any]]:
+    """Retrieves a cached company profile from `company_profiles` table."""
+    client = get_supabase_client()
+    if not client:
+        return None
+    try:
+        response = client.table("company_profiles").select("*").eq("company_name", company_name.lower().strip()).execute()
+        if response.data:
+            return response.data[0]
+    except Exception as e:
+        print(f"[DB Warning] Error fetching cached company: {e}")
+    return None
+
+async def save_company_profile(company_name: str, scraped_markdown: str, company_url: Optional[str] = None) -> Optional[str]:
+    """Saves or updates a company's scraped markdown context. Returns the company UUID."""
+    client = get_supabase_client()
+    if not client:
+        return None
+    name_clean = company_name.lower().strip()
+    try:
+        # Upsert based on the unique company_name field
+        payload = {
+            "company_name": name_clean,
+            "company_url": company_url or name_clean,
+            "scraped_markdown": scraped_markdown
+        }
+        response = client.table("company_profiles").upsert(payload, on_conflict="company_name").execute()
+        if response.data:
+            return response.data[0]["id"]
+    except Exception as e:
+        print(f"[DB Error] Error saving company profile: {e}")
+    return None
+
+async def fetch_cached_prep_sheet(company_name: str, job_title: str, seller_product: str) -> Optional[Dict[str, Any]]:
+    """Checks if a matching prep-sheet exists in `sales_prep_sheets`."""
+    client = get_supabase_client()
+    if not client:
+        return None
+    try:
+        company = await fetch_cached_company(company_name)
+        if not company:
+            return None
+            
+        response = client.table("sales_prep_sheets").select("*")\
+            .eq("company_id", company["id"])\
+            .eq("target_role", job_title.strip())\
+            .eq("my_product_pitch", seller_product.strip())\
+            .execute()
+            
+        if response.data:
+            return response.data[0]
+    except Exception as e:
+        print(f"[DB Warning] Error fetching cached prep sheet: {e}")
+    return None
+
+async def save_prep_sheet(company_id: str, job_title: str, seller_product: str, payload: Dict[str, Any]) -> bool:
+    """Inserts a generated prep-sheet dossier into the database."""
+    client = get_supabase_client()
+    if not client:
+        return False
+    try:
+        db_payload = {
+            "company_id": company_id,
+            "target_role": job_title.strip(),
+            "my_product_pitch": seller_product.strip(),
+            "ai_generated_payload": payload
+        }
+        client.table("sales_prep_sheets").insert(db_payload).execute()
+        return True
+    except Exception as e:
+        print(f"[DB Error] Error inserting prep sheet: {e}")
+        return False
+
+async def fetch_recent_briefings(limit: int = 10) -> List[Dict[str, Any]]:
+    """Fetches list of recently generated prep sheets with company details for sidebar history."""
+    client = get_supabase_client()
+    if not client:
+        return []
+    try:
+        # Fetch sheets joined with company names
+        response = client.table("sales_prep_sheets")\
+            .select("id, target_role, my_product_pitch, ai_generated_payload, created_at, company_profiles(company_name)")\
+            .order("created_at", desc=True)\
+            .limit(limit)\
+            .execute()
+        return response.data or []
+    except Exception as e:
+        print(f"[DB Error] Error fetching recent briefings: {e}")
+        return []
+```
+
+---
+
+## 5. Data Scraping & Database Cache Check (`backend/scraper.py`)
+
+The scraper uses **Jina Reader API** (`https://r.jina.ai/`) but first checks if the company profile context exists in the Supabase database cache.
 
 ```python
 import os
 import httpx
-from typing import Dict, TypedDict
+from typing import Dict, TypedDict, Optional
+from backend.database import fetch_cached_company, save_company_profile
 
 class ScraperResult(TypedDict):
     raw_context: str
     data_source: str
+    company_id: Optional[str] # DB reference ID if present
 
 # Map domain queries to local mock filepaths
 MOCK_DOMAINS: Dict[str, str] = {
@@ -202,7 +329,6 @@ MOCK_DOMAINS: Dict[str, str] = {
 def clean_markdown(text: str) -> str:
     """Removes excessive line breaks, raw navigation menus, or system markdown junk."""
     lines = [line.strip() for line in text.splitlines()]
-    # Remove large runs of empty lines
     cleaned = []
     prev_empty = False
     for line in lines:
@@ -217,22 +343,36 @@ def clean_markdown(text: str) -> str:
 
 async def scrape_company_domain(domain_url: str) -> ScraperResult:
     """
-    Attempts to scrape a domain via Jina Reader. 
-    Falls back to mock data if domain matches MOCK_DOMAINS or if request fails.
+    Checks Supabase Cache first. If not cached, attempts to scrape domain via Jina Reader.
+    Falls back to mock text files if offline or fails. Updates Supabase cache on success.
     """
     cleaned_url = domain_url.lower().replace("https://", "").replace("http://", "").strip("/")
     
-    # Check if domain has a direct mock registered
+    # 1. Check Database Cache First
+    db_record = await fetch_cached_company(cleaned_url)
+    if db_record and db_record.get("scraped_markdown"):
+        return {
+            "raw_context": db_record["scraped_markdown"],
+            "data_source": "database",
+            "company_id": db_record["id"]
+        }
+
+    # 2. Check if domain has a direct local mock registered (for offline UI/testing compatibility)
     if cleaned_url in MOCK_DOMAINS:
         file_path = MOCK_DOMAINS[cleaned_url]
         if os.path.exists(file_path):
+            content = ""
             with open(file_path, "r", encoding="utf-8") as f:
-                return {
-                    "raw_context": clean_markdown(f.read()),
-                    "data_source": "cached"
-                }
+                content = clean_markdown(f.read())
+            # Save mock load to database if connection available
+            company_id = await save_company_profile(cleaned_url, content)
+            return {
+                "raw_context": content,
+                "data_source": "cached",
+                "company_id": company_id
+            }
                 
-    # Attempt Live Scrape
+    # 3. Attempt Live Scrape via Jina Reader
     jina_api_key = os.getenv("JINA_API_KEY")
     headers = {}
     if jina_api_key:
@@ -244,222 +384,56 @@ async def scrape_company_domain(domain_url: str) -> ScraperResult:
         try:
             response = await client.get(jina_endpoint, headers=headers)
             if response.status_code == 200:
+                raw_text = clean_markdown(response.text)
+                # Store new scrape context in database
+                company_id = await save_company_profile(cleaned_url, raw_text)
                 return {
-                    "raw_context": clean_markdown(response.text),
-                    "data_source": "live"
+                    "raw_context": raw_text,
+                    "data_source": "live",
+                    "company_id": company_id
                 }
         except httpx.HTTPError:
-            # Fallback on exceptions (e.g. timeouts or connection errors)
             pass
             
-    # Universal Fallback to mock_company.txt
+    # 4. Universal Fallback to mock_company.txt
     fallback_path = MOCK_DOMAINS["mock_company.com"]
     if os.path.exists(fallback_path):
-         with open(fallback_path, "r", encoding="utf-8") as f:
-             return {
-                 "raw_context": clean_markdown(f.read()),
-                 "data_source": "cached"
-             }
+        content = ""
+        with open(fallback_path, "r", encoding="utf-8") as f:
+            content = clean_markdown(f.read())
+        company_id = await save_company_profile(cleaned_url, content)
+        return {
+            "raw_context": content,
+            "data_source": "cached",
+            "company_id": company_id
+        }
              
-    # Final emergency baseline context
+    # 5. Final emergency baseline context
+    company_id = await save_company_profile(cleaned_url, f"Baseline context for {domain_url}.")
     return {
         "raw_context": f"Baseline context for {domain_url}. Manual input required.",
-        "data_source": "cached"
+        "data_source": "cached",
+        "company_id": company_id
     }
-```
-
----
-
-## 5. Agent Engine & OpenRouter Client (`backend/agents.py`)
-
-This file manages the communication with **OpenRouter**, enforcing structured JSON responses and implementing a self-healing **1-Retry Validation Loop** if Pydantic parsing fails.
-
-```python
-import os
-import json
-from typing import Type
-import httpx
-from pydantic import BaseModel, ValidationError
-
-async def call_openrouter(
-    model: str, 
-    system_prompt: str, 
-    user_prompt: str, 
-    schema: Type[BaseModel]
-) -> BaseModel:
-    """
-    Sends request to OpenRouter API. Enforces JSON output using JSON Mode, 
-    and handles Pydantic schema validation. If validation fails, performs
-    one defensive re-prompt containing validation details.
-    """
-    api_key = os.getenv("OPENROUTER_API_KEY")
-    if not api_key:
-        raise ValueError("OPENROUTER_API_KEY environment variable is not set.")
-        
-    url = "https://openrouter.ai/api/v1/chat/completions"
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-        "HTTP-Referer": "http://localhost:8501", # Required OpenRouter origin metadata
-        "X-Title": "ConsulBot"
-    }
-    
-    # Construct structured prompt informing model of JSON expectations
-    # Inject schema.model_json_schema() into user guidelines to give LLM exact shape
-    schema_definition = json.dumps(schema.model_json_schema(), indent=2)
-    
-    formatted_user_prompt = (
-        f"{user_prompt}\n\n"
-        f"IMPORTANT: You must return a JSON object that adheres strictly to this schema:\n"
-        f"{schema_definition}\n\n"
-        f"Do not write any markdown wrappers (like ```json ... ```) outside the JSON block."
-    )
-    
-    payload = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": formatted_user_prompt}
-        ],
-        "response_format": {"type": "json_object"},
-        "temperature": 0.1 # Low temperature for reliable extraction
-    }
-    
-    async with httpx.AsyncClient(timeout=45.0) as client:
-        # --- Attempt 1 ---
-        response = await client.post(url, headers=headers, json=payload)
-        response.raise_for_status()
-        res_data = response.json()
-        raw_text = res_data["choices"][0]["message"]["content"]
-        
-        try:
-            return schema.model_validate_json(raw_text)
-        except (ValidationError, json.JSONDecodeError) as e:
-            # --- Attempt 2: Structured Re-prompt / Recovery Loop ---
-            retry_user_prompt = (
-                f"{formatted_user_prompt}\n\n"
-                f"--- EXCEPTION DETECTED ---\n"
-                f"Your previous response failed validation with the following error:\n"
-                f"{str(e)}\n\n"
-                f"Please fix the error, make sure all constraints (such as length, item count) "
-                f"are strictly met, and provide a valid JSON object."
-            )
-            payload["messages"] = [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": retry_user_prompt}
-            ]
-            
-            retry_response = await client.post(url, headers=headers, json=payload)
-            retry_response.raise_for_status()
-            retry_res_data = retry_response.json()
-            retry_raw_text = retry_res_data["choices"][0]["message"]["content"]
-            
-            # If this validation fails, propagate the error up
-            return schema.model_validate_json(retry_raw_text)
-
-# -------------------------------------------------------------
-# Individual Agent Execution Logic & Prompts
-# -------------------------------------------------------------
-
-async def run_company_brief_agent(raw_context: str) -> CompanyBriefSchema:
-    model = os.getenv("MODEL_COMPANY_BRIEF", "google/gemini-2.5-flash:free")
-    
-    system_prompt = (
-        "You are an expert analyst. Your job is to extract high-level intelligence "
-        "about a target company from its website markdown. Focus on what they do "
-        "and find up to 2 major recent updates (fundraising, product expansions, milestones)."
-    )
-    
-    user_prompt = (
-        f"Read the following website markdown context and extract a short summary "
-        f"and 0 to 2 milestones.\n\n"
-        f"Context:\n{raw_context}"
-    )
-    
-    return await call_openrouter(model, system_prompt, user_prompt, CompanyBriefSchema)
-
-
-async def run_pain_points_agent(raw_context: str, job_title: str) -> PainPointSchema:
-    model = os.getenv("MODEL_PAIN_POINTS", "meta-llama/llama-3-8b-instruct:free")
-    
-    system_prompt = (
-        "You are a B2B sales strategist. You infer pain points for specific corporate job roles "
-        "by looking at company website context. Focus on strategic, operational, or technical pain "
-        "points they likely face based on their context."
-    )
-    
-    user_prompt = (
-        f"Analyze the context and details for the job title: '{job_title}'. "
-        f"Infer EXACTLY 3 strategic pain points that this role is responsible for solving. "
-        f"For each, write down the 'challenge' and 'why_it_matters'.\n\n"
-        f"Context:\n{raw_context}"
-    )
-    
-    return await call_openrouter(model, system_prompt, user_prompt, PainPointSchema)
-
-
-async def run_icebreakers_agent(company_brief: CompanyBriefSchema, job_title: str) -> IcebreakerSchema:
-    model = os.getenv("MODEL_ICEBREAKERS", "google/gemini-2.5-flash:free")
-    
-    system_prompt = (
-        "You are a warm, professional networker. You formulate open-ended conversational questions "
-        "that showcase you have done your research about their company. Do not use generic templates."
-    )
-    
-    brief_data = f"Summary: {company_brief.short_summary}\nMilestones: {', '.join(company_brief.recent_milestones)}"
-    user_prompt = (
-        f"Based on the following company profile and the prospect's job title: '{job_title}', "
-        f"generate between 2 and 3 open-ended icebreaker questions ending with '?'.\n\n"
-        f"Company Details:\n{brief_data}"
-    )
-    
-    return await call_openrouter(model, system_prompt, user_prompt, IcebreakerSchema)
-
-
-async def run_hook_pitch_agent(
-    company_brief: CompanyBriefSchema, 
-    pain_points: PainPointSchema, 
-    icebreakers: IcebreakerSchema, 
-    job_title: str, 
-    seller_product: str
-) -> HookPitchSchema:
-    model = os.getenv("MODEL_HOOK_PITCH", "meta-llama/llama-3-8b-instruct:free")
-    
-    system_prompt = (
-        "You are a world-class B2B sales copywriter. You write compelling hooks (cold email openers "
-        "or verbal openers) and value-proposition pitches that connect a seller's product directly "
-        "to a prospect's inferred pain points."
-    )
-    
-    pain_points_text = "\n".join([f"- {p.challenge}: {p.why_it_matters}" for p in pain_points.strategic_pain_points])
-    
-    user_prompt = (
-        f"Target Job Title: {job_title}\n"
-        f"Seller's Product/Solution: {seller_product}\n\n"
-        f"Company Brief:\n{company_brief.short_summary}\n\n"
-        f"Prospect's Pain Points:\n{pain_points_text}\n\n"
-        f"Your task:\n"
-        f"1. Generate a 'golden_hook' - a B2B conversation opener/cold email hook. Maximum 30 words. "
-        f"It must capture attention instantly, referring subtly to their corporate context.\n"
-        f"2. Generate a 'tailored_pitch' - a highly relevant, 3-to-4 sentence value proposition "
-        f"connecting the seller's product to the pain points."
-    )
-    
-    return await call_openrouter(model, system_prompt, user_prompt, HookPitchSchema)
 ```
 
 ---
 
 ## 6. Orchestration Flow (`backend/orchestrator.py`)
 
-The orchestrator brings the scraping and agent logic together, passing inputs between stages and returning the finalized complete schema structure.
+The orchestrator checks database history for the final generated sheet before kicking off the chained LLM pipeline.
 
 ```python
 import datetime
+from backend.database import fetch_cached_prep_sheet, save_prep_sheet
 from backend.scraper import scrape_company_domain
 from backend.schemas import (
     FullPrepSheetSchema, 
-    MetaSchema
+    MetaSchema,
+    CompanyBriefSchema,
+    PainPointSchema,
+    IcebreakerSchema,
+    HookPitchSchema
 )
 from backend.agents import (
     run_company_brief_agent,
@@ -475,28 +449,42 @@ async def generate_prep_sheet(
 ) -> FullPrepSheetSchema:
     """
     Executes the sequential multi-agent execution pipeline.
+    Checks DB cache for pre-computed dossier first to return in 0.1 seconds.
     """
-    # Stage 0: Scrape or Fallback Mock Data
-    scraper_res = await scrape_company_domain(company_domain)
+    domain_clean = company_domain.lower().strip()
+    role_clean = job_title.strip()
+    pitch_clean = seller_product.strip()
+
+    # 1. Check if complete Dossier is already generated in database
+    dossier_record = await fetch_cached_prep_sheet(domain_clean, role_clean, pitch_clean)
+    if dossier_record:
+        payload = dossier_record["ai_generated_payload"]
+        # Update metadata to show it was sourced from database
+        payload["meta"]["data_source"] = "database"
+        return FullPrepSheetSchema.model_validate(payload)
+
+    # 2. Complete Dossier is not found - Run Stage 0 (Scraper check / load)
+    scraper_res = await scrape_company_domain(domain_clean)
     raw_context = scraper_res["raw_context"]
     data_source = scraper_res["data_source"]
+    company_id = scraper_res["company_id"]
     
     # Stage 1: Extract Company Brief
     company_brief = await run_company_brief_agent(raw_context)
     
     # Stage 2: Infer Pain Points
-    pain_points = await run_pain_points_agent(raw_context, job_title)
+    pain_points = await run_pain_points_agent(raw_context, role_clean)
     
     # Stage 3: Generate Icebreaker Questions
-    icebreakers = await run_icebreakers_agent(company_brief, job_title)
+    icebreakers = await run_icebreakers_agent(company_brief, role_clean)
     
     # Stage 4: Synthesize Golden Hook and Pitch
     hook_pitch = await run_hook_pitch_agent(
         company_brief=company_brief,
         pain_points=pain_points,
         icebreakers=icebreakers,
-        job_title=job_title,
-        seller_product=seller_product
+        job_title=role_clean,
+        seller_product=pitch_clean
     )
     
     # Package metadata
@@ -505,144 +493,94 @@ async def generate_prep_sheet(
         timestamp=datetime.datetime.now(datetime.timezone.utc).isoformat()
     )
     
-    # Return fully validated payload
-    return FullPrepSheetSchema(
-        company_name=company_domain,
-        job_title=job_title,
-        seller_product=seller_product,
+    final_sheet = FullPrepSheetSchema(
+        company_name=domain_clean,
+        job_title=role_clean,
+        seller_product=pitch_clean,
         company_brief=company_brief,
         pain_points=pain_points,
         icebreakers=icebreakers,
         hook_pitch=hook_pitch,
         meta=meta
     )
+
+    # 3. Save the newly generated prep sheet to the database
+    if company_id:
+        await save_prep_sheet(company_id, role_clean, pitch_clean, final_sheet.model_dump())
+    
+    return final_sheet
 ```
 
 ---
 
 ## 7. Step-by-Step Backend Agent Directives
 
-The backend agent should follow this sequence to implement and test the backend.
-
-### Phase 1: Environment & File Prep
-1. Initialize the `requirements.txt` file at root level.
-2. Initialize `.env` file from the templates and add valid API credentials.
-3. Create the directories: `backend/`, `frontend/`, `tests/` and `mock_data/`.
-4. Create mock data files in `mock_data/`:
-   - `stripe.txt`: Copy standard homepage texts or use clean mockup data.
-   - `vercel.txt`: Mock Vercel homepage data.
-   - `mock_company.txt`: Universal generic profile.
-
-### Phase 2: Schema Development
-1. Create `backend/schemas.py` and populate the structures.
-2. Create and run `tests/test_schemas.py` to ensure Pydantic validates inputs correctly and fails when custom validations fail.
-
-### Phase 3: Scraper Logic
-1. Create `backend/scraper.py`.
-2. Create `tests/test_scraper.py` to assert correct mock mappings and live HTTP call handling (offline behavior vs online behavior).
-
-### Phase 4: Agents Core & Retry System
-1. Create `backend/agents.py`.
-2. Implement OpenRouter call with validation retries.
-3. Test OpenRouter connectivity with standard models configured.
-
-### Phase 5: Pipeline Orchestration
-1. Create `backend/orchestrator.py` chaining the agents sequentially.
-2. Build and run `tests/test_orchestrator.py` executing a full pass using mock scraper fallbacks to verify JSON integration.
+1. **DB Schema Setup:** Install `supabase` in `requirements.txt`. Make sure the Postgres schema in Supabase has correct constraints.
+2. **Database Helper (`backend/database.py`):** Code Supabase connection using async or standard calls.
+3. **Scraper logic updates (`backend/scraper.py`):** Check DB for company markdown cache prior to contacting Jina Reader.
+4. **Orchestrator logic updates (`backend/orchestrator.py`):** Check DB for existing compiled dossiers, returning immediately on hit, and saving on pipeline completion.
 
 ---
 
 ## 8. Verification & Isolation Test Scripts
 
-The following scripts should be created in the `tests/` directory to facilitate unit testing during implementation.
+Create `tests/test_database.py` to check database caching functions:
 
-### Test 1: Pydantic Schema Validation (`tests/test_schemas.py`)
-Run command: `python -m tests.test_schemas`
 ```python
-import unittest
-from pydantic import ValidationError
-from backend.schemas import PainPointSchema, IcebreakerSchema, HookPitchSchema
-
-class TestValidationSchemas(unittest.TestCase):
-    def test_pain_point_validation(self):
-        # Should fail when list count != 3
-        with self.assertRaises(ValidationError):
-            PainPointSchema(strategic_pain_points=[
-                {"challenge": "c1", "why_it_matters": "w1"}
-            ])
-            
-    def test_icebreaker_validation(self):
-        # Should fail if question does not end with "?"
-        with self.assertRaises(ValidationError):
-            IcebreakerSchema(icebreaker_questions=["No question mark"])
-
-    def test_hook_validation(self):
-        # Should fail if hook is > 30 words
-        long_hook = " ".join(["word"] * 31)
-        with self.assertRaises(ValidationError):
-            HookPitchSchema(golden_hook=long_hook, tailored_pitch="A good pitch.")
-
-if __name__ == "__main__":
-    unittest.main()
-```
-
-### Test 2: Scraper Mock and API Fetching (`tests/test_scraper.py`)
-Run command: `python -m tests.test_scraper`
-```python
+# Run: python -m tests.test_database
 import asyncio
-from backend.scraper import scrape_company_domain
-
-async def run_scraper_test():
-    print("Testing stripe.com fallback...")
-    res = await scrape_company_domain("stripe.com")
-    print(f"Data source: {res['data_source']}")
-    assert res["data_source"] == "cached"
-    
-    print("Testing unregistered domain fallback...")
-    res2 = await scrape_company_domain("unknown-domain.io")
-    print(f"Data source: {res2['data_source']}")
-    assert res2["data_source"] == "cached"
-    print("All scraper isolation checks passed!")
-
-if __name__ == "__main__":
-    asyncio.run(run_scraper_test())
-```
-
-### Test 3: Orchestrator End-to-End Pipeline (`tests/test_orchestrator.py`)
-Run command: `python -m tests.test_orchestrator`
-```python
 import os
-import asyncio
+import unittest
 from dotenv import load_dotenv
 load_dotenv()
 
-from backend.orchestrator import generate_prep_sheet
+from backend.database import save_company_profile, fetch_cached_company, save_prep_sheet, fetch_cached_prep_sheet
 
-async def main():
-    if not os.getenv("OPENROUTER_API_KEY"):
-        print("Skipping integration test: OPENROUTER_API_KEY is not set.")
-        return
-        
-    print("Running integration test for stripe.com with orchestrator...")
-    result = await generate_prep_sheet(
-        company_domain="stripe.com",
-        job_title="Director of Engineering",
-        seller_product="ConsulBot automated scaling platform"
-    )
-    
-    print("\n--- Synthesis Complete ---")
-    print(f"Company Summary:\n{result.company_brief.short_summary}\n")
-    print(f"Milestones: {result.company_brief.recent_milestones}\n")
-    print(f"Pain Points:")
-    for point in result.pain_points.strategic_pain_points:
-        print(f"- {point.challenge} (Why: {point.why_it_matters})")
-    print(f"\nIcebreakers:")
-    for question in result.icebreakers.icebreaker_questions:
-        print(f"- {question}")
-    print(f"\nGolden Hook: {result.hook_pitch.golden_hook}")
-    print(f"Pitch: {result.hook_pitch.tailored_pitch}")
-    print(f"Source: {result.meta.data_source}")
+class TestDatabaseCaching(unittest.TestCase):
+    def setUp(self):
+        self.test_company = "pytest_temp.com"
+        self.test_role = "QA Engineer"
+        self.test_pitch = "Testing software"
+
+    async def run_db_tests(self):
+        url = os.getenv("SUPABASE_URL")
+        key = os.getenv("SUPABASE_KEY")
+        if not url or not key:
+            print("Skipping DB tests: No Supabase configs found.")
+            return
+
+        print("Testing company cache storage...")
+        company_id = await save_company_profile(self.test_company, "## Temporary Scraped Markdown")
+        self.assertIsNotNone(company_id)
+
+        print("Testing company cache fetch...")
+        company = await fetch_cached_company(self.test_company)
+        self.assertIsNotNone(company)
+        self.assertEqual(company["company_name"], self.test_company)
+
+        print("Testing prep-sheet cache insertion...")
+        dummy_payload = {
+            "company_name": self.test_company,
+            "job_title": self.test_role,
+            "seller_product": self.test_pitch,
+            "company_brief": {"short_summary": "Test Co summary.", "recent_milestones": []},
+            "pain_points": {"strategic_pain_points": [{"challenge": "c", "why_it_matters": "w"}] * 3},
+            "icebreakers": {"icebreaker_questions": ["Q1?", "Q2?"]},
+            "hook_pitch": {"golden_hook": "Hook.", "tailored_pitch": "Pitch."},
+            "meta": {"data_source": "live"}
+        }
+        success = await save_prep_sheet(company_id, self.test_role, self.test_pitch, dummy_payload)
+        self.assertTrue(success)
+
+        print("Testing prep-sheet cache read...")
+        sheet = await fetch_cached_prep_sheet(self.test_company, self.test_role, self.test_pitch)
+        self.assertIsNotNone(sheet)
+        self.assertEqual(sheet["target_role"], self.test_role)
+        print("All Database cache tests completed successfully!")
+
+    def test_runner(self):
+        asyncio.run(self.run_db_tests())
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    unittest.main()
 ```
