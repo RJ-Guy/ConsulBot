@@ -3,6 +3,10 @@ import json
 import httpx
 from typing import Type, List, Dict, Any
 from pydantic import BaseModel, ValidationError
+from dotenv import load_dotenv
+
+# Load env variables from .env if present
+load_dotenv()
 
 # Safe and robust import fallbacks to support backend/4backend folder configurations
 try:
